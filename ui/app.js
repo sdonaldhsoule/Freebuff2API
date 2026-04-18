@@ -27,6 +27,11 @@ function bindElements() {
     "metricModels",
     "metricAccountsMode",
     "metricPools",
+    "metricTotalRequests",
+    "metricSuccessRequests",
+    "metricFailedRequests",
+    "metricSuccessRate",
+    "metricStatsMode",
     "runtimeState",
     "modelSearch",
     "modelList",
@@ -90,6 +95,7 @@ function updateSessionUI() {
   el.loginOverlay.classList.toggle("hidden", state.authenticated);
   el.accountStoreBadge.textContent = state.accountStoreEnabled ? "SQLite 已启用" : "Legacy 模式";
   el.metricAccountsMode.textContent = state.accountStoreEnabled ? "账号池模式" : "Legacy Token 模式";
+  el.metricStatsMode.textContent = state.accountStoreEnabled ? "累计统计" : "未启用";
 }
 
 async function onLoginSubmit(event) {
@@ -158,6 +164,7 @@ function renderHealth() {
   el.metricUptime.textContent = String(health.uptime_sec ?? "-");
   el.metricModels.textContent = String(state.models.length);
   el.metricPools.textContent = String((health.token_state || []).length);
+  renderGlobalStats(health.stats_enabled ? health.stats : null);
 
   const snapshots = Array.isArray(health.token_state) ? health.token_state : [];
   if (snapshots.length === 0) {
@@ -174,7 +181,7 @@ function renderHealth() {
               <strong>${escapeHTML(run.agent_id)}</strong>
               <span>run=${escapeHTML(run.run_id)}</span>
               <span>并发 ${run.inflight}</span>
-              <span>请求 ${run.request_count}</span>
+              <span>当前 run 请求 ${run.request_count}</span>
             </div>`
         )
         .join("");
@@ -241,6 +248,9 @@ function renderAccounts() {
           </header>
           <div class="account-meta">
             <div>优先级 ${account.priority} · 权重 ${account.weight} · ${account.enabled ? "已启用" : "已停用"}</div>
+            <div>累计请求 ${formatCount(account.total_requests)} · 成功 ${formatCount(account.success_requests)} · 失败 ${formatCount(account.failed_requests)}</div>
+            <div>最近使用：${account.last_used_at ? escapeHTML(formatDateTime(account.last_used_at)) : "暂无"}</div>
+            <div>最近成功：${account.last_success_at ? escapeHTML(formatDateTime(account.last_success_at)) : "暂无"} · 最近失败：${account.last_failure_at ? escapeHTML(formatDateTime(account.last_failure_at)) : "暂无"}</div>
             <div>最近检查：${account.last_checked_at ? escapeHTML(formatDateTime(account.last_checked_at)) : "未校验"}</div>
             <div>${account.last_error ? `错误：${escapeHTML(account.last_error)}` : "暂无错误"}</div>
           </div>
@@ -263,6 +273,21 @@ function fillModelSelect() {
   if (current && state.models.some((model) => model.id === current)) {
     el.debugModel.value = current;
   }
+}
+
+function renderGlobalStats(stats) {
+  if (!stats) {
+    el.metricTotalRequests.textContent = "-";
+    el.metricSuccessRequests.textContent = "-";
+    el.metricFailedRequests.textContent = "-";
+    el.metricSuccessRate.textContent = "-";
+    return;
+  }
+
+  el.metricTotalRequests.textContent = formatCount(stats.total_requests);
+  el.metricSuccessRequests.textContent = formatCount(stats.success_requests);
+  el.metricFailedRequests.textContent = formatCount(stats.failed_requests);
+  el.metricSuccessRate.textContent = `${((Number(stats.success_rate) || 0) * 100).toFixed(1)}%`;
 }
 
 async function onAccountSubmit(event) {
@@ -566,6 +591,11 @@ function formatDateTime(value) {
     return "-";
   }
   return date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function formatCount(value) {
+  const number = Number(value || 0);
+  return number.toLocaleString("zh-CN");
 }
 
 function escapeHTML(value) {

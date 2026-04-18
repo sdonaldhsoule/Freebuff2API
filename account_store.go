@@ -81,18 +81,32 @@ func (c *TokenCipher) Decrypt(payload string) (string, error) {
 }
 
 type AccountRecord struct {
-	ID            string
-	Label         string
-	Token         string
-	TokenPreview  string
-	Enabled       bool
-	Priority      int
-	Weight        int
-	LastStatus    string
-	LastError     string
-	LastCheckedAt time.Time
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	ID              string
+	Label           string
+	Token           string
+	TokenPreview    string
+	Enabled         bool
+	Priority        int
+	Weight          int
+	LastStatus      string
+	LastError       string
+	LastCheckedAt   time.Time
+	TotalRequests   int64
+	SuccessRequests int64
+	FailedRequests  int64
+	LastUsedAt      time.Time
+	LastSuccessAt   time.Time
+	LastFailureAt   time.Time
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
+type RequestStats struct {
+	TotalRequests   int64     `json:"total_requests"`
+	SuccessRequests int64     `json:"success_requests"`
+	FailedRequests  int64     `json:"failed_requests"`
+	SuccessRate     float64   `json:"success_rate"`
+	UpdatedAt       time.Time `json:"updated_at,omitempty"`
 }
 
 type AccountInput struct {
@@ -167,7 +181,20 @@ func (s *AccountStore) initSchema(ctx context.Context) error {
 			last_status TEXT NOT NULL DEFAULT 'unknown',
 			last_error TEXT NOT NULL DEFAULT '',
 			last_checked_at TEXT NOT NULL DEFAULT '',
+			total_requests INTEGER NOT NULL DEFAULT 0,
+			success_requests INTEGER NOT NULL DEFAULT 0,
+			failed_requests INTEGER NOT NULL DEFAULT 0,
+			last_used_at TEXT NOT NULL DEFAULT '',
+			last_success_at TEXT NOT NULL DEFAULT '',
+			last_failure_at TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);`,
+		`CREATE TABLE IF NOT EXISTS request_stats (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			total_requests INTEGER NOT NULL DEFAULT 0,
+			success_requests INTEGER NOT NULL DEFAULT 0,
+			failed_requests INTEGER NOT NULL DEFAULT 0,
 			updated_at TEXT NOT NULL
 		);`,
 	}
@@ -176,6 +203,23 @@ func (s *AccountStore) initSchema(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("init schema: %w", err)
 		}
+	}
+	if err := s.ensureTableColumns(ctx, "accounts", map[string]string{
+		"total_requests":   "INTEGER NOT NULL DEFAULT 0",
+		"success_requests": "INTEGER NOT NULL DEFAULT 0",
+		"failed_requests":  "INTEGER NOT NULL DEFAULT 0",
+		"last_used_at":     "TEXT NOT NULL DEFAULT ''",
+		"last_success_at":  "TEXT NOT NULL DEFAULT ''",
+		"last_failure_at":  "TEXT NOT NULL DEFAULT ''",
+	}); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT OR IGNORE INTO request_stats (
+			id, total_requests, success_requests, failed_requests, updated_at
+		) VALUES (1, 0, 0, 0, ?)
+	`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		return fmt.Errorf("seed request stats: %w", err)
 	}
 	return nil
 }
@@ -192,7 +236,9 @@ func (s *AccountStore) Count(ctx context.Context) (int, error) {
 func (s *AccountStore) List(ctx context.Context) ([]AccountRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, label, token_ciphertext, token_preview, enabled, priority, weight,
-		       last_status, last_error, last_checked_at, created_at, updated_at
+		       last_status, last_error, last_checked_at, total_requests, success_requests,
+		       failed_requests, last_used_at, last_success_at, last_failure_at,
+		       created_at, updated_at
 		FROM accounts
 		ORDER BY enabled DESC, priority DESC, weight DESC, created_at ASC`)
 	if err != nil {
@@ -217,7 +263,9 @@ func (s *AccountStore) List(ctx context.Context) ([]AccountRecord, error) {
 func (s *AccountStore) Get(ctx context.Context, id string) (AccountRecord, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, label, token_ciphertext, token_preview, enabled, priority, weight,
-		       last_status, last_error, last_checked_at, created_at, updated_at
+		       last_status, last_error, last_checked_at, total_requests, success_requests,
+		       failed_requests, last_used_at, last_success_at, last_failure_at,
+		       created_at, updated_at
 		FROM accounts
 		WHERE id = ?`, strings.TrimSpace(id))
 	record, err := s.scanAccount(row)
@@ -251,8 +299,10 @@ func (s *AccountStore) Create(ctx context.Context, input AccountInput) (AccountR
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO accounts (
 			id, label, token_ciphertext, token_preview, enabled, priority, weight,
-			last_status, last_error, last_checked_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			last_status, last_error, last_checked_at, total_requests, success_requests,
+			failed_requests, last_used_at, last_success_at, last_failure_at,
+			created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		record.ID,
 		record.Label,
 		ciphertext,
@@ -263,6 +313,12 @@ func (s *AccountStore) Create(ctx context.Context, input AccountInput) (AccountR
 		record.LastStatus,
 		record.LastError,
 		formatOptionalTime(record.LastCheckedAt),
+		record.TotalRequests,
+		record.SuccessRequests,
+		record.FailedRequests,
+		formatOptionalTime(record.LastUsedAt),
+		formatOptionalTime(record.LastSuccessAt),
+		formatOptionalTime(record.LastFailureAt),
 		record.CreatedAt.Format(time.RFC3339Nano),
 		record.UpdatedAt.Format(time.RFC3339Nano),
 	)
@@ -312,7 +368,9 @@ func (s *AccountStore) Update(ctx context.Context, id string, input AccountUpdat
 	_, err = s.db.ExecContext(ctx, `
 		UPDATE accounts
 		SET label = ?, token_ciphertext = ?, token_preview = ?, enabled = ?, priority = ?, weight = ?,
-		    last_status = ?, last_error = ?, last_checked_at = ?, updated_at = ?
+		    last_status = ?, last_error = ?, last_checked_at = ?, total_requests = ?,
+		    success_requests = ?, failed_requests = ?, last_used_at = ?, last_success_at = ?,
+		    last_failure_at = ?, updated_at = ?
 		WHERE id = ?`,
 		current.Label,
 		ciphertext,
@@ -323,6 +381,12 @@ func (s *AccountStore) Update(ctx context.Context, id string, input AccountUpdat
 		current.LastStatus,
 		current.LastError,
 		formatOptionalTime(current.LastCheckedAt),
+		current.TotalRequests,
+		current.SuccessRequests,
+		current.FailedRequests,
+		formatOptionalTime(current.LastUsedAt),
+		formatOptionalTime(current.LastSuccessAt),
+		formatOptionalTime(current.LastFailureAt),
 		current.UpdatedAt.Format(time.RFC3339Nano),
 		current.ID,
 	)
@@ -374,6 +438,89 @@ func (s *AccountStore) UpdateValidation(ctx context.Context, id, status, lastErr
 	return nil
 }
 
+func (s *AccountStore) Stats(ctx context.Context) (RequestStats, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT total_requests, success_requests, failed_requests, updated_at
+		FROM request_stats
+		WHERE id = 1`)
+
+	var (
+		stats      RequestStats
+		updatedRaw string
+	)
+	if err := row.Scan(&stats.TotalRequests, &stats.SuccessRequests, &stats.FailedRequests, &updatedRaw); err != nil {
+		return RequestStats{}, fmt.Errorf("query request stats: %w", err)
+	}
+	stats.UpdatedAt = parseOptionalTime(updatedRaw)
+	stats.SuccessRate = calculateSuccessRate(stats.TotalRequests, stats.SuccessRequests)
+	return stats, nil
+}
+
+func (s *AccountStore) RecordGlobalRequestStart(ctx context.Context) error {
+	return s.updateRequestStats(ctx, "total_requests = total_requests + 1")
+}
+
+func (s *AccountStore) RecordGlobalRequestSuccess(ctx context.Context) error {
+	return s.updateRequestStats(ctx, "success_requests = success_requests + 1")
+}
+
+func (s *AccountStore) RecordGlobalRequestFailure(ctx context.Context) error {
+	return s.updateRequestStats(ctx, "failed_requests = failed_requests + 1")
+}
+
+func (s *AccountStore) RecordAccountRequestStart(ctx context.Context, id string) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE accounts
+		SET total_requests = total_requests + 1,
+		    last_used_at = ?,
+		    updated_at = ?
+		WHERE id = ?`,
+		time.Now().UTC().Format(time.RFC3339Nano),
+		time.Now().UTC().Format(time.RFC3339Nano),
+		strings.TrimSpace(id),
+	)
+	if err != nil {
+		return fmt.Errorf("record account request start: %w", err)
+	}
+	return ensureSingleAccountAffected(result, id)
+}
+
+func (s *AccountStore) RecordAccountRequestSuccess(ctx context.Context, id string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE accounts
+		SET success_requests = success_requests + 1,
+		    last_success_at = ?,
+		    updated_at = ?
+		WHERE id = ?`,
+		now,
+		now,
+		strings.TrimSpace(id),
+	)
+	if err != nil {
+		return fmt.Errorf("record account request success: %w", err)
+	}
+	return ensureSingleAccountAffected(result, id)
+}
+
+func (s *AccountStore) RecordAccountRequestFailure(ctx context.Context, id string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE accounts
+		SET failed_requests = failed_requests + 1,
+		    last_failure_at = ?,
+		    updated_at = ?
+		WHERE id = ?`,
+		now,
+		now,
+		strings.TrimSpace(id),
+	)
+	if err != nil {
+		return fmt.Errorf("record account request failure: %w", err)
+	}
+	return ensureSingleAccountAffected(result, id)
+}
+
 func (s *AccountStore) scanAccount(scanner interface {
 	Scan(dest ...any) error
 }) (AccountRecord, error) {
@@ -382,6 +529,9 @@ func (s *AccountStore) scanAccount(scanner interface {
 		tokenCiphertext string
 		enabled         int
 		lastCheckedRaw  string
+		lastUsedRaw     string
+		lastSuccessRaw  string
+		lastFailureRaw  string
 		createdRaw      string
 		updatedRaw      string
 	)
@@ -397,6 +547,12 @@ func (s *AccountStore) scanAccount(scanner interface {
 		&record.LastStatus,
 		&record.LastError,
 		&lastCheckedRaw,
+		&record.TotalRequests,
+		&record.SuccessRequests,
+		&record.FailedRequests,
+		&lastUsedRaw,
+		&lastSuccessRaw,
+		&lastFailureRaw,
 		&createdRaw,
 		&updatedRaw,
 	); err != nil {
@@ -410,6 +566,9 @@ func (s *AccountStore) scanAccount(scanner interface {
 	record.Token = token
 	record.Enabled = enabled == 1
 	record.LastCheckedAt = parseOptionalTime(lastCheckedRaw)
+	record.LastUsedAt = parseOptionalTime(lastUsedRaw)
+	record.LastSuccessAt = parseOptionalTime(lastSuccessRaw)
+	record.LastFailureAt = parseOptionalTime(lastFailureRaw)
 	record.CreatedAt = parseOptionalTime(createdRaw)
 	record.UpdatedAt = parseOptionalTime(updatedRaw)
 	record.LastStatus = normalizeAccountStatus(record.LastStatus)
@@ -507,4 +666,81 @@ func maskToken(token string) string {
 		return strings.Repeat("*", len(token))
 	}
 	return token[:4] + "..." + token[len(token)-4:]
+}
+
+func (s *AccountStore) updateRequestStats(ctx context.Context, setClause string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	query := fmt.Sprintf(`
+		UPDATE request_stats
+		SET %s,
+		    updated_at = ?
+		WHERE id = 1`, setClause)
+	result, err := s.db.ExecContext(ctx, query, now)
+	if err != nil {
+		return fmt.Errorf("update request stats: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("request stats rows affected: %w", err)
+	}
+	if affected == 0 {
+		return errors.New("request stats row missing")
+	}
+	return nil
+}
+
+func (s *AccountStore) ensureTableColumns(ctx context.Context, table string, columns map[string]string) error {
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return fmt.Errorf("query %s schema: %w", table, err)
+	}
+	defer rows.Close()
+
+	existing := make(map[string]struct{})
+	for rows.Next() {
+		var (
+			cid          int
+			name         string
+			columnType   string
+			notNull      int
+			defaultValue sql.NullString
+			pk           int
+		)
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			return fmt.Errorf("scan %s schema: %w", table, err)
+		}
+		existing[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate %s schema: %w", table, err)
+	}
+
+	for name, definition := range columns {
+		if _, ok := existing[name]; ok {
+			continue
+		}
+		statement := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, name, definition)
+		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("alter %s add %s: %w", table, name, err)
+		}
+	}
+	return nil
+}
+
+func ensureSingleAccountAffected(result sql.Result, id string) error {
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rows affected: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("account %q not found", id)
+	}
+	return nil
+}
+
+func calculateSuccessRate(totalRequests, successRequests int64) float64 {
+	if totalRequests <= 0 {
+		return 0
+	}
+	return float64(successRequests) / float64(totalRequests)
 }

@@ -131,7 +131,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error", "")
 		return
 	}
-	writeJSON(w, http.StatusOK, s.healthPayload())
+	writeJSON(w, http.StatusOK, s.healthPayload(r.Context()))
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
@@ -176,19 +176,24 @@ func (s *Server) proxyChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.accounts.RecordRequestStart()
 	startTime := time.Now()
 
 	for attempt := 0; attempt < 2; attempt++ {
 		lease, err := s.runs.Acquire(r.Context(), agentID)
 		if err != nil {
+			s.accounts.RecordRequestFailure()
 			writeOpenAIError(w, http.StatusBadGateway, "no healthy upstream auth token available", "server_error", "")
 			return
 		}
+		s.accounts.RecordAccountAttempt(lease.pool.accountID)
 
 		s.logger.Printf("[%s] Routing request (model: %s) via run: %s", lease.pool.label, requestedModel, lease.run.id)
 
 		upstreamBody, err := s.injectUpstreamMetadata(payload, requestedModel, lease.run.id)
 		if err != nil {
+			s.accounts.RecordAccountFailure(lease.pool.accountID)
+			s.accounts.RecordRequestFailure()
 			s.runs.Release(lease)
 			writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
 			return
@@ -196,12 +201,16 @@ func (s *Server) proxyChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		resp, errorBody, err := s.client.ChatCompletions(r.Context(), lease.pool.token, upstreamBody)
 		if err != nil {
+			s.accounts.RecordAccountFailure(lease.pool.accountID)
+			s.accounts.RecordRequestFailure()
 			s.runs.Release(lease)
 			writeOpenAIError(w, http.StatusBadGateway, err.Error(), "server_error", "")
 			return
 		}
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			s.accounts.RecordAccountSuccess(lease.pool.accountID)
+			s.accounts.RecordRequestSuccess()
 			defer resp.Body.Close()
 			copyHeaders(w.Header(), resp.Header)
 			w.WriteHeader(resp.StatusCode)
@@ -214,12 +223,15 @@ func (s *Server) proxyChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if isRunInvalid(resp.StatusCode, errorBody) {
+			s.accounts.RecordAccountFailure(lease.pool.accountID)
 			s.logger.Printf("%s: run %s invalid, rotating and retrying", lease.pool.label, lease.run.id)
 			s.runs.Invalidate(lease, strings.TrimSpace(string(errorBody)))
 			s.runs.Release(lease)
 			continue
 		}
 
+		s.accounts.RecordAccountFailure(lease.pool.accountID)
+		s.accounts.RecordRequestFailure()
 		if resp.StatusCode == http.StatusUnauthorized {
 			reason := "upstream auth rejected token"
 			s.runs.Cooldown(lease, 30*time.Minute, reason)
@@ -232,6 +244,7 @@ func (s *Server) proxyChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.accounts.RecordRequestFailure()
 	writeOpenAIError(w, http.StatusBadGateway, "upstream run expired twice in a row", "server_error", "")
 }
 
@@ -255,14 +268,26 @@ func (s *Server) injectUpstreamMetadata(payload map[string]any, requestedModel, 
 	return body, nil
 }
 
-func (s *Server) healthPayload() map[string]any {
-	return map[string]any{
+func (s *Server) healthPayload(ctx context.Context) map[string]any {
+	payload := map[string]any{
 		"ok":                    true,
 		"started_at":            s.started.UTC(),
 		"uptime_sec":            int(time.Since(s.started).Seconds()),
 		"token_state":           s.runs.Snapshots(),
 		"account_store_enabled": s.accounts.Enabled(),
 	}
+
+	stats, enabled, err := s.accounts.Stats(ctx)
+	payload["stats_enabled"] = enabled
+	if err != nil {
+		s.logger.Printf("health payload stats failed: %v", err)
+		payload["stats_error"] = err.Error()
+		return payload
+	}
+	if enabled {
+		payload["stats"] = stats
+	}
+	return payload
 }
 
 func (s *Server) modelsPayload() map[string]any {
@@ -359,7 +384,7 @@ func (s *Server) handleWebHealthz(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": map[string]any{"message": "method not allowed"}})
 		return
 	}
-	writeJSON(w, http.StatusOK, s.healthPayload())
+	writeJSON(w, http.StatusOK, s.healthPayload(r.Context()))
 }
 
 func (s *Server) handleWebModels(w http.ResponseWriter, r *http.Request) {

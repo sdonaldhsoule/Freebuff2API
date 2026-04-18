@@ -18,17 +18,23 @@ type RuntimeAccount struct {
 }
 
 type AccountView struct {
-	ID            string    `json:"id"`
-	Label         string    `json:"label"`
-	TokenPreview  string    `json:"token_preview"`
-	Enabled       bool      `json:"enabled"`
-	Priority      int       `json:"priority"`
-	Weight        int       `json:"weight"`
-	LastStatus    string    `json:"last_status"`
-	LastError     string    `json:"last_error"`
-	LastCheckedAt time.Time `json:"last_checked_at,omitempty"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	ID              string    `json:"id"`
+	Label           string    `json:"label"`
+	TokenPreview    string    `json:"token_preview"`
+	Enabled         bool      `json:"enabled"`
+	Priority        int       `json:"priority"`
+	Weight          int       `json:"weight"`
+	LastStatus      string    `json:"last_status"`
+	LastError       string    `json:"last_error"`
+	LastCheckedAt   time.Time `json:"last_checked_at,omitempty"`
+	TotalRequests   int64     `json:"total_requests"`
+	SuccessRequests int64     `json:"success_requests"`
+	FailedRequests  int64     `json:"failed_requests"`
+	LastUsedAt      time.Time `json:"last_used_at,omitempty"`
+	LastSuccessAt   time.Time `json:"last_success_at,omitempty"`
+	LastFailureAt   time.Time `json:"last_failure_at,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 type AccountManager struct {
@@ -53,6 +59,17 @@ func NewAccountManager(cfg Config, logger *log.Logger, store *AccountStore, clie
 
 func (m *AccountManager) Enabled() bool {
 	return m != nil && m.store != nil
+}
+
+func (m *AccountManager) Stats(ctx context.Context) (RequestStats, bool, error) {
+	if !m.Enabled() {
+		return RequestStats{}, false, nil
+	}
+	stats, err := m.store.Stats(ctx)
+	if err != nil {
+		return RequestStats{}, true, err
+	}
+	return stats, true, nil
 }
 
 func (m *AccountManager) Bootstrap(ctx context.Context) error {
@@ -209,6 +226,42 @@ func (m *AccountManager) MarkInvalid(ctx context.Context, id, reason string) {
 	}
 }
 
+func (m *AccountManager) RecordRequestStart() {
+	m.withStatsContext("record global request start", func(ctx context.Context) error {
+		return m.store.RecordGlobalRequestStart(ctx)
+	})
+}
+
+func (m *AccountManager) RecordRequestSuccess() {
+	m.withStatsContext("record global request success", func(ctx context.Context) error {
+		return m.store.RecordGlobalRequestSuccess(ctx)
+	})
+}
+
+func (m *AccountManager) RecordRequestFailure() {
+	m.withStatsContext("record global request failure", func(ctx context.Context) error {
+		return m.store.RecordGlobalRequestFailure(ctx)
+	})
+}
+
+func (m *AccountManager) RecordAccountAttempt(id string) {
+	m.withStatsContext("record account request start", func(ctx context.Context) error {
+		return m.store.RecordAccountRequestStart(ctx, id)
+	})
+}
+
+func (m *AccountManager) RecordAccountSuccess(id string) {
+	m.withStatsContext("record account request success", func(ctx context.Context) error {
+		return m.store.RecordAccountRequestSuccess(ctx, id)
+	})
+}
+
+func (m *AccountManager) RecordAccountFailure(id string) {
+	m.withStatsContext("record account request failure", func(ctx context.Context) error {
+		return m.store.RecordAccountRequestFailure(ctx, id)
+	})
+}
+
 func (m *AccountManager) validateToken(ctx context.Context, token string) error {
 	if len(trackedAgents) == 0 {
 		return nil
@@ -247,17 +300,23 @@ func runtimeAccountsFromRecords(records []AccountRecord) []RuntimeAccount {
 
 func toAccountView(record AccountRecord) AccountView {
 	return AccountView{
-		ID:            record.ID,
-		Label:         record.Label,
-		TokenPreview:  record.TokenPreview,
-		Enabled:       record.Enabled,
-		Priority:      record.Priority,
-		Weight:        record.Weight,
-		LastStatus:    record.LastStatus,
-		LastError:     record.LastError,
-		LastCheckedAt: record.LastCheckedAt,
-		CreatedAt:     record.CreatedAt,
-		UpdatedAt:     record.UpdatedAt,
+		ID:              record.ID,
+		Label:           record.Label,
+		TokenPreview:    record.TokenPreview,
+		Enabled:         record.Enabled,
+		Priority:        record.Priority,
+		Weight:          record.Weight,
+		LastStatus:      record.LastStatus,
+		LastError:       record.LastError,
+		LastCheckedAt:   record.LastCheckedAt,
+		TotalRequests:   record.TotalRequests,
+		SuccessRequests: record.SuccessRequests,
+		FailedRequests:  record.FailedRequests,
+		LastUsedAt:      record.LastUsedAt,
+		LastSuccessAt:   record.LastSuccessAt,
+		LastFailureAt:   record.LastFailureAt,
+		CreatedAt:       record.CreatedAt,
+		UpdatedAt:       record.UpdatedAt,
 	}
 }
 
@@ -309,4 +368,15 @@ func truncateError(message string) string {
 		return message
 	}
 	return message[:300]
+}
+
+func (m *AccountManager) withStatsContext(action string, fn func(ctx context.Context) error) {
+	if !m.Enabled() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := fn(ctx); err != nil {
+		m.logger.Printf("account manager: %s failed: %v", action, err)
+	}
 }
