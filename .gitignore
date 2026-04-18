@@ -1,0 +1,19 @@
+# Build output
+Freebuff-Go.exe
+*.exe
+
+# Go build cache
+.gocache/
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Config with secrets
+config.json

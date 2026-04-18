@@ -229,7 +229,7 @@ function renderAccounts() {
 
   el.accountList.innerHTML = state.accounts
     .map((account) => {
-      const selected = state.activeAccountId === account.id ? "style='border-color: rgba(240, 179, 93, 0.55)'" : "";
+      const selected = state.activeAccountId === account.id ? "style='border-color: rgba(99, 102, 241, 0.45); box-shadow: 0 0 0 1px rgba(99, 102, 241, 0.25)'" : "";
       return `
         <article class="account-card" ${selected}>
           <header>
@@ -579,10 +579,14 @@ function escapeHTML(value) {
 
 function toast(message, isError = false) {
   el.toast.textContent = message;
-  el.toast.style.borderColor = isError ? "rgba(255, 109, 109, 0.42)" : "rgba(87, 211, 155, 0.28)";
+  el.toast.classList.toggle("toast-error", isError);
+  el.toast.classList.toggle("toast-success", !isError);
   el.toast.classList.add("visible");
   clearTimeout(state.toastTimer);
-  state.toastTimer = setTimeout(() => el.toast.classList.remove("visible"), 2600);
+  state.toastTimer = setTimeout(() => {
+    el.toast.classList.remove("visible");
+    el.toast.classList.remove("toast-error", "toast-success");
+  }, 2600);
 }
 
 async function guarded(fn) {
