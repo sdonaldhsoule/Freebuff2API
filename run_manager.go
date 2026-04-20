@@ -17,10 +17,12 @@ type RunManager struct {
 	logger *log.Logger
 	client *UpstreamClient
 
-	mu           sync.RWMutex
-	activePools  map[string]*tokenPool
-	retiredPools []*tokenPool
-	next         atomic.Uint64
+	mu              sync.RWMutex
+	activePools     map[string]*tokenPool
+	retiredPools    []*tokenPool
+	prewarmAgentIDs []string
+	runCtx          context.Context
+	next            atomic.Uint64
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -37,11 +39,14 @@ type tokenPool struct {
 	weight    int
 	retired   bool
 
-	mu            sync.Mutex
-	runs          map[string]*managedRun // agentID → current run
-	draining      []*managedRun
-	lastError     string
-	cooldownUntil time.Time
+	mu                      sync.Mutex
+	runs                    map[string]*managedRun
+	draining                []*managedRun
+	session                 *cachedSession
+	sessionRefreshCh        chan struct{}
+	sessionRebuildScheduled bool
+	lastError               string
+	cooldownUntil           time.Time
 }
 
 type managedRun struct {
@@ -59,14 +64,17 @@ type runLease struct {
 }
 
 type tokenSnapshot struct {
-	ID            string        `json:"id"`
-	Name          string        `json:"name"`
-	Priority      int           `json:"priority"`
-	Weight        int           `json:"weight"`
-	Runs          []runSnapshot `json:"runs"`
-	DrainingRuns  int           `json:"draining_runs"`
-	CooldownUntil time.Time     `json:"cooldown_until,omitempty"`
-	LastError     string        `json:"last_error,omitempty"`
+	ID                string        `json:"id"`
+	Name              string        `json:"name"`
+	Priority          int           `json:"priority"`
+	Weight            int           `json:"weight"`
+	Runs              []runSnapshot `json:"runs"`
+	DrainingRuns      int           `json:"draining_runs"`
+	SessionStatus     string        `json:"session_status,omitempty"`
+	SessionInstanceID string        `json:"session_instance_id,omitempty"`
+	SessionExpiresAt  time.Time     `json:"session_expires_at,omitempty"`
+	CooldownUntil     time.Time     `json:"cooldown_until,omitempty"`
+	LastError         string        `json:"last_error,omitempty"`
 }
 
 type runSnapshot struct {
@@ -87,7 +95,21 @@ func NewRunManager(cfg Config, client *UpstreamClient, logger *log.Logger) *RunM
 	}
 }
 
-func (m *RunManager) Start(ctx context.Context) {
+func (m *RunManager) Start(ctx context.Context, agentIDs []string) {
+	m.mu.Lock()
+	m.runCtx = ctx
+	m.prewarmAgentIDs = compactAgentIDs(agentIDs)
+	active := make([]*tokenPool, 0, len(m.activePools))
+	for _, pool := range m.activePools {
+		active = append(active, pool)
+	}
+	agentIDs = append([]string(nil), m.prewarmAgentIDs...)
+	m.mu.Unlock()
+
+	if len(active) > 0 {
+		go m.prewarmPools(ctx, active, agentIDs)
+	}
+
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
@@ -120,12 +142,14 @@ func (m *RunManager) SyncAccounts(ctx context.Context, accounts []RuntimeAccount
 	}
 
 	var prewarm []*tokenPool
+	var prewarmCtx context.Context
+	var agentIDs []string
 
 	m.mu.Lock()
 	for id, account := range desired {
 		existing, ok := m.activePools[id]
 		if ok && existing.token == account.Token {
-			existing.label = account.Label
+			existing.label = accountLabel(account)
 			existing.priority = account.Priority
 			existing.weight = account.Weight
 			existing.retired = false
@@ -150,14 +174,52 @@ func (m *RunManager) SyncAccounts(ctx context.Context, accounts []RuntimeAccount
 		pool.retired = true
 		m.retiredPools = append(m.retiredPools, pool)
 	}
+
+	prewarmCtx = m.runCtx
+	agentIDs = append([]string(nil), m.prewarmAgentIDs...)
 	m.mu.Unlock()
 
-	for _, pool := range prewarm {
-		if err := pool.prewarm(ctx); err != nil {
-			m.logger.Printf("%s: prewarm failed: %v", pool.label, err)
+	if len(prewarm) > 0 && prewarmCtx != nil {
+		go m.prewarmPools(prewarmCtx, prewarm, agentIDs)
+	}
+
+	return nil
+}
+
+func (m *RunManager) prewarmPools(ctx context.Context, pools []*tokenPool, agentIDs []string) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	sort.Slice(pools, func(i, j int) bool {
+		if pools[i].priority != pools[j].priority {
+			return pools[i].priority > pools[j].priority
+		}
+		if pools[i].weight != pools[j].weight {
+			return pools[i].weight > pools[j].weight
+		}
+		return pools[i].label < pools[j].label
+	})
+
+	for _, pool := range pools {
+		go pool.prewarmSession(ctx)
+
+		for _, agentID := range agentIDs {
+			agentID = strings.TrimSpace(agentID)
+			if agentID == "" {
+				continue
+			}
+
+			rotateCtx, cancel := context.WithTimeout(ctx, m.cfg.RequestTimeout)
+			err := pool.rotateAgent(rotateCtx, agentID)
+			cancel()
+			if err != nil {
+				m.logger.Printf("%s: prewarm %s failed: %v", pool.label, agentID, err)
+				continue
+			}
+			m.logger.Printf("%s: prewarmed %s", pool.label, agentID)
 		}
 	}
-	return nil
 }
 
 func (m *RunManager) maintainAll(ctx context.Context) {
@@ -232,12 +294,23 @@ func (m *RunManager) Acquire(ctx context.Context, agentID string) (*runLease, er
 	)
 
 	for _, group := range groupPoolsByPriority(candidates) {
-		for _, pool := range weightedPoolOrder(group, seed) {
-			lease, err := pool.acquire(ctx, agentID)
-			if err == nil {
-				return lease, nil
+		ordered := weightedPoolOrder(group, seed)
+		for pass := 0; pass < 2; pass++ {
+			for _, pool := range ordered {
+				ready := pool.hasReadySession()
+				if pass == 0 && !ready {
+					continue
+				}
+				if pass == 1 && ready {
+					continue
+				}
+
+				lease, err := pool.acquire(ctx, agentID)
+				if err == nil {
+					return lease, nil
+				}
+				errs = append(errs, fmt.Sprintf("%s: %v", pool.label, err))
 			}
-			errs = append(errs, fmt.Sprintf("%s: %v", pool.label, err))
 		}
 	}
 
@@ -294,9 +367,10 @@ func newTokenPool(account RuntimeAccount, cfg Config, client *UpstreamClient, lo
 	if account.Weight <= 0 {
 		account.Weight = 1
 	}
+
 	return &tokenPool{
 		accountID: account.ID,
-		label:     account.Label,
+		label:     accountLabel(account),
 		token:     account.Token,
 		cfg:       cfg,
 		client:    client,
@@ -305,15 +379,6 @@ func newTokenPool(account RuntimeAccount, cfg Config, client *UpstreamClient, lo
 		weight:    account.Weight,
 		runs:      make(map[string]*managedRun),
 	}
-}
-
-func (p *tokenPool) prewarm(ctx context.Context) error {
-	for _, agentID := range trackedAgents {
-		if err := p.rotateAgent(ctx, agentID); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (p *tokenPool) acquire(ctx context.Context, agentID string) (*runLease, error) {
@@ -331,6 +396,10 @@ func (p *tokenPool) acquire(ctx context.Context, agentID string) (*runLease, err
 		if err := p.rotateAgent(ctx, agentID); err != nil {
 			return nil, err
 		}
+	}
+
+	if _, err := p.ensureSession(ctx); err != nil {
+		return nil, err
 	}
 
 	p.mu.Lock()
@@ -396,6 +465,9 @@ func (p *tokenPool) shutdown(ctx context.Context) error {
 		if err := p.client.FinishRun(ctx, p.token, run.id, run.requestCount); err != nil {
 			errs = append(errs, err.Error())
 		}
+	}
+	if err := p.endSession(ctx); err != nil {
+		errs = append(errs, err.Error())
 	}
 	if len(errs) > 0 {
 		return errors.New(strings.Join(errs, "; "))
@@ -543,6 +615,11 @@ func (p *tokenPool) snapshot() tokenSnapshot {
 		CooldownUntil: p.cooldownUntil,
 		LastError:     p.lastError,
 	}
+	if p.session != nil {
+		snapshot.SessionStatus = string(p.session.status)
+		snapshot.SessionInstanceID = p.session.instanceID
+		snapshot.SessionExpiresAt = p.session.expiresAt
+	}
 	for agentID, run := range p.runs {
 		snapshot.Runs = append(snapshot.Runs, runSnapshot{
 			AgentID:      agentID,
@@ -564,10 +641,7 @@ func (p *tokenPool) isIdle() bool {
 	if len(p.draining) > 0 {
 		return false
 	}
-	for _, run := range p.runs {
-		if run.inflight > 0 {
-			return false
-		}
+	for range p.runs {
 		return false
 	}
 	return true
@@ -629,4 +703,33 @@ func weightedPoolOrder(pools []*tokenPool, seed uint64) []*tokenPool {
 		ordered = append(ordered, pool)
 	}
 	return ordered
+}
+
+func compactAgentIDs(agentIDs []string) []string {
+	if len(agentIDs) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(agentIDs))
+	compacted := make([]string, 0, len(agentIDs))
+	for _, agentID := range agentIDs {
+		agentID = strings.TrimSpace(agentID)
+		if agentID == "" {
+			continue
+		}
+		if _, ok := seen[agentID]; ok {
+			continue
+		}
+		seen[agentID] = struct{}{}
+		compacted = append(compacted, agentID)
+	}
+	return compacted
+}
+
+func accountLabel(account RuntimeAccount) string {
+	label := strings.TrimSpace(account.Label)
+	if label != "" {
+		return label
+	}
+	return strings.TrimSpace(account.ID)
 }

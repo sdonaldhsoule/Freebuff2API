@@ -16,7 +16,7 @@ func main() {
 	configPath := flag.String("config", "", "path to a JSON config file (default: config.json if present)")
 	flag.Parse()
 
-	logger := log.New(os.Stdout, "[Freebuff-Go] ", log.LstdFlags|log.Lmsgprefix)
+	logger := log.New(os.Stdout, "[Freebuff2API] ", log.LstdFlags|log.Lmsgprefix)
 
 	// Auto-detect config.json in CWD when no flag is given
 	if *configPath == "" {
@@ -58,6 +58,7 @@ func main() {
 		cancelStart()
 		logger.Fatalf("bootstrap accounts: %v", err)
 	}
+	cancelStart()
 
 	server := NewServer(
 		cfg,
@@ -68,8 +69,9 @@ func main() {
 		accountManager,
 		NewSessionManager(cfg.WebPassword, 24*time.Hour),
 	)
-	server.Start(startCtx)
-	cancelStart()
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	defer cancelRun()
+	server.Start(runCtx)
 
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -94,5 +96,6 @@ func main() {
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Printf("http shutdown error: %v", err)
 	}
+	cancelRun()
 	server.Shutdown(shutdownCtx)
 }

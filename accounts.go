@@ -263,11 +263,9 @@ func (m *AccountManager) RecordAccountFailure(id string) {
 }
 
 func (m *AccountManager) validateToken(ctx context.Context, token string) error {
-	if len(trackedAgents) == 0 {
-		return nil
-	}
+	const validationAgentID = "editor-lite"
 
-	runID, err := m.client.StartRun(ctx, token, trackedAgents[0])
+	runID, err := m.client.StartRun(ctx, token, validationAgentID)
 	if err != nil {
 		return err
 	}

@@ -13,7 +13,15 @@ Freebuff2API is an OpenAI-compatible proxy server for [Freebuff](https://freebuf
 
 ## Getting Auth Tokens
 
-Freebuff2API requires one or more Freebuff **auth tokens**. The easiest way is to install the Freebuff CLI:
+Freebuff2API requires one or more Freebuff **auth tokens**. There are two ways to obtain one:
+
+### Method 1 — Web (Recommended)
+
+Visit **[https://freebuff.llm.pm](https://freebuff.llm.pm)**, log in with your Freebuff account, and your auth token will be displayed directly on the page. Copy it as your **AUTH_TOKENS** — no local installation required.
+
+### Method 2 — Freebuff CLI
+
+Install the Freebuff CLI:
 
 ```bash
 npm i -g freebuff
